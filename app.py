@@ -117,7 +117,7 @@ st.caption("Date-only • Coin presets only • No target solver • No future p
 with st.sidebar:
     st.header("Inputs")
 
-    st.subheader("Date Range (LA)")
+    st.subheader("Date Range")
     start_date = st.date_input("Date of loss", value=date(2022, 7, 28))
     end_date = st.date_input("End date", value=date.today())
 
