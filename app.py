@@ -1,9 +1,21 @@
 # app.py
-# Streamlit "Time × Money" Damages Calculator
-# by Max's AI dev buddy 🤝
+# Time × Money Damages Calculator (date-only, coin presets only)
+# ─────────────────────────────────────────────────────────────
+# - Inputs: start date (date of loss), end date (defaults to today)
+# - Units: second/minute/hour/day
+# - Rate: coin presets only (penny, nickel, dime, quarter, dollar)
+# - Targeting: show closest preset combos, or solve exact rate for the chosen unit
+# - Future projection: optional (years/days)
+# - Exports: CSV for scenarios; PDF summary if 'reportlab' is installed
+#
+# Notes:
+# * Date-only handling: we compute elapsed seconds between [start @ 00:00:00] and [end @ 23:59:59.999...],
+#   i.e., treating the end date as a full day. Toggle "Inclusive days" only affects the *displayed* day count
+#   (for narrative friendliness), not the underlying seconds math (which already spans the full end day).
+# * No custom rate control—only coin presets, per your request.
 
 import math
-from datetime import datetime, date, time, timedelta, timezone
+from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 import io
 
@@ -14,11 +26,10 @@ import streamlit as st
 # Optional PDF export
 try:
     from reportlab.lib.pagesizes import LETTER
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import inch
-    from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors
+    from reportlab.lib.units import inch
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -32,7 +43,7 @@ TIME_UNITS = {
     "second": 1,
     "minute": 60,
     "hour": 3600,
-    "day": 86400,  # elapsed seconds; DST handled at datetime diff layer
+    "day": 86400,
 }
 
 COIN_PRESETS = [
@@ -46,15 +57,17 @@ COIN_PRESETS = [
 def money(x: float) -> str:
     return f"${x:,.2f}"
 
-def as_tzaware(d: date, t: time, tz=LA_TZ) -> datetime:
-    # Combine date and time, assume tz-local naive -> make aware in LA_TZ
-    naive = datetime.combine(d, t)
-    return naive.replace(tzinfo=tz)
+def start_of_day(dt_date: date) -> datetime:
+    # 00:00:00 local time
+    return datetime.combine(dt_date, time.min).replace(tzinfo=LA_TZ)
+
+def end_of_day(dt_date: date) -> datetime:
+    # 23:59:59.999999 local time
+    return datetime.combine(dt_date, time.max).replace(tzinfo=LA_TZ)
 
 def elapsed_seconds(start_dt: datetime, end_dt: datetime) -> float:
-    """Precise elapsed seconds (exclusive end)."""
     delta = end_dt - start_dt
-    return delta.total_seconds()
+    return max(delta.total_seconds(), 0.0)
 
 def all_units(seconds: float) -> dict:
     return {
@@ -80,8 +93,8 @@ def closest_scenarios(seconds: float, target_amount: float, units_list, coins_li
             diff = abs(amt - target_amount)
             rows.append({
                 "Time Unit": tu,
-                "Rate (per unit)": val,
                 "Coin": name,
+                "Rate (per unit)": val,
                 "Amount": amt,
                 "Abs Δ from target": diff,
                 "% Δ": (diff / target_amount * 100.0) if target_amount else np.nan,
@@ -90,40 +103,38 @@ def closest_scenarios(seconds: float, target_amount: float, units_list, coins_li
     df.sort_values(by=["Abs Δ from target"], inplace=True, ascending=True)
     return df.head(top_k), df
 
-def add_future_seconds(base_end: datetime, add_days: float = 0.0, add_years: float = 0.0) -> float:
-    """Simple future projection: years≈365.2425 days to stay civil (no extra deps)."""
+def add_future_seconds(add_days: float = 0.0, add_years: float = 0.0) -> float:
+    # Simple: 1 civil year ≈ 365.2425 days
     total_days = add_days + (add_years * 365.2425)
     return total_days * 86400.0
 
-def make_narrative(start_dt: datetime, end_dt: datetime, seconds: float, unit: str, rate: float, amount: float) -> str:
+def make_narrative(start_dt: datetime, end_dt: datetime, seconds: float, unit: str, rate: float, amount: float, inclusive_days_flag: bool) -> str:
     au = all_units(seconds)
-    if unit == "minute":
-        units_val = au["minutes"]
-    elif unit == "hour":
-        units_val = au["hours"]
-    elif unit == "day":
-        units_val = au["days"]
-    else:
-        units_val = au["seconds"]
+    units_val = {
+        "second": au["seconds"],
+        "minute": au["minutes"],
+        "hour":   au["hours"],
+        "day":    au["days"],
+    }[unit]
+
+    # Days for display (optionally inclusive)
+    disp_days = au["days"] + (1.0 if inclusive_days_flag else 0.0)
 
     return (
-        f"From {start_dt.strftime('%b %d, %Y, %I:%M %p %Z')} to "
-        f"{end_dt.strftime('%b %d, %Y, %I:%M %p %Z')}, that’s approximately "
-        f"{units_val:,.0f} {unit}{'' if units_val == 1 else 's'} of continuous pain. "
+        f"From {start_dt.date():%b %d, %Y} through {end_dt.date():%b %d, %Y}, "
+        f"that’s approximately {units_val:,.0f} {unit}{'' if units_val == 1 else 's'} "
+        f"({disp_days:,.2f} day span for juror-friendly counting). "
         f"At {money(rate)} per {unit}, the past pain-and-suffering equals {money(amount)}."
     )
 
 def export_summary_pdf(buffer: io.BytesIO, header: str, summary: dict, df_scenarios: pd.DataFrame | None):
-    """Write a simple 1–2 page PDF to the buffer."""
     doc = SimpleDocTemplate(buffer, pagesize=LETTER,
                             rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
     flow = []
-
     flow.append(Paragraph(header, styles["Title"]))
     flow.append(Spacer(1, 0.20 * inch))
 
-    # Summary bullets
     for k, v in summary.items():
         flow.append(Paragraph(f"<b>{k}:</b> {v}", styles["BodyText"]))
         flow.append(Spacer(1, 0.06 * inch))
@@ -132,7 +143,6 @@ def export_summary_pdf(buffer: io.BytesIO, header: str, summary: dict, df_scenar
 
     if df_scenarios is not None and not df_scenarios.empty:
         flow.append(Paragraph("Top Target-Match Scenarios", styles["Heading2"]))
-        # Limit to first 12 to keep it tidy
         show = df_scenarios.head(12).copy()
         show["Amount"] = show["Amount"].map(money)
         show["Rate (per unit)"] = show["Rate (per unit)"].map(lambda x: f"${x:,.2f}")
@@ -167,73 +177,62 @@ st.set_page_config(
 )
 
 st.title("⏱️ Time × Money Damages Calculator")
-st.caption("Convert time lived with pain into a clear, jury-friendly dollar figure. Flexible units, coin presets, target solver, and exports.")
+st.caption("Date-only input • Coin presets only • Target solver • Scenario grid • Narrative • Exports")
 
 with st.sidebar:
     st.header("Inputs")
 
-    st.subheader("Date & Time Range (LA time)")
-    colA, colB = st.columns(2)
-    with colA:
-        start_date = st.date_input("Date of loss", value=date(2022, 7, 28))
-        start_time = st.time_input("Start time", value=time(0, 0))
-    with colB:
-        use_now = st.toggle("Use current time as end", value=True)
-        end_date = st.date_input("End date", value=date.today(), disabled=use_now)
-        end_time = st.time_input("End time", value=datetime.now(LA_TZ).time().replace(microsecond=0), disabled=use_now)
+    st.subheader("Date Range (LA)")
+    start_date = st.date_input("Date of loss", value=date(2022, 7, 28))
+    end_date = st.date_input("End date", value=date.today())
 
     st.subheader("Counting options")
-    inclusive_days = st.checkbox("Inclusive days (add 1 day to day count)", value=False,
-                                 help="For statements like 'counting the day of the incident as a full day'.")
+    inclusive_days = st.checkbox(
+        "Inclusive days (adds +1 to the displayed day count)",
+        value=False,
+        help="For phrasing like 'counting the day of the incident as a full day'."
+    )
 
-    st.subheader("Unit & Rate")
-    unit = st.selectbox("Time unit", list(TIME_UNITS.keys()), index=1)  # default minute
+    st.subheader("Unit & Rate (presets only)")
+    unit = st.selectbox("Time unit", list(TIME_UNITS.keys()), index=1)  # default to 'minute'
     preset_names = [n for n, _ in COIN_PRESETS]
-    sel_preset = st.selectbox("Coin preset", ["(none)"] + preset_names, index=4)  # default Dollar
-    custom_rate = st.number_input("Custom rate (per chosen unit)", min_value=0.0, value=0.25, step=0.01)
-
-    applied_rate = custom_rate
-    if sel_preset != "(none)":
-        applied_rate = dict(COIN_PRESETS)[sel_preset]
+    sel_preset = st.selectbox("Coin preset", preset_names, index=4)     # default to 'Dollar'
+    applied_rate = dict(COIN_PRESETS)[sel_preset]
 
     st.subheader("Targeting (optional)")
     target_toggle = st.checkbox("Target a number (e.g., $400,000)", value=True)
-    target_amount = st.number_input("Target total $", min_value=0.0, value=400_000.00, step=1_000.00, format="%.2f", disabled=not target_toggle)
+    target_amount = st.number_input(
+        "Target total $",
+        min_value=0.0, value=400_000.00, step=1_000.00, format="%.2f",
+        disabled=not target_toggle
+    )
     target_mode = st.radio(
         "Target mode",
         options=["Show best preset combos", "Solve exact rate for current unit"],
         index=0,
         disabled=not target_toggle,
-        help="Pick whether to search nice preset combos, or directly solve the exact per-unit rate."
+        help="Compare clean preset combos or compute the exact per-unit rate for your chosen unit."
     )
 
     st.subheader("Future Projection (optional)")
     add_future = st.checkbox("Add future pain window", value=False)
-    fut_years = st.number_input("Future years (adds ~365.2425 days/yr)", min_value=0.0, value=0.0, step=0.5, disabled=not add_future)
+    fut_years = st.number_input("Future years (~365.2425 days/yr)", min_value=0.0, value=0.0, step=0.5, disabled=not add_future)
     fut_days = st.number_input("Future days", min_value=0.0, value=0.0, step=1.0, disabled=not add_future)
 
-# Construct aware start/end
-start_dt = as_tzaware(start_date, start_time, tz=LA_TZ)
-if use_now:
-    end_dt = datetime.now(LA_TZ)
-else:
-    end_dt = as_tzaware(end_date, end_time, tz=LA_TZ)
-
-if end_dt < start_dt:
-    st.error("End datetime must be after start datetime.")
+# Validate dates
+if end_date < start_date:
+    st.error("End date must be on or after the date of loss.")
     st.stop()
 
+# Build datetime span covering whole days
+start_dt = start_of_day(start_date)
+end_dt = end_of_day(end_date)
+
+# Base window seconds (past pain)
 base_seconds = elapsed_seconds(start_dt, end_dt)
-sec_for_display = base_seconds
 
-# Inclusive-day option only affects the *day count* presentation (not the precise money calculation).
-inc_days_bonus = 1.0 if inclusive_days else 0.0
-
-# Future projection
-future_seconds = 0.0
-if add_future:
-    future_seconds = add_future_seconds(end_dt, add_days=fut_days, add_years=fut_years)
-
+# Future projection seconds
+future_seconds = add_future_seconds(add_days=fut_days, add_years=fut_years) if add_future else 0.0
 total_seconds = base_seconds + future_seconds
 
 # ---------- Main Hero & Breakdown ----------
@@ -255,38 +254,38 @@ with hero_col:
             value=money(amount_total)
         )
 
-    st.caption("Amounts are rounded to 2 decimals for display; internal math retains full precision.")
+    st.caption("Display rounds to cents; internal math retains full precision.")
 
 with info_col:
     au_base = all_units(base_seconds)
     au_total = all_units(total_seconds)
 
-    # Day count display w/ inclusive option
-    days_disp = au_base["days"] + inc_days_bonus
-    days_total_disp = au_total["days"] + inc_days_bonus
+    # Day count display (optionally inclusive)
+    days_disp = au_base["days"] + (1.0 if inclusive_days else 0.0)
+    days_total_disp = au_total["days"] + (1.0 if inclusive_days else 0.0)
 
     st.subheader("Time Breakdown")
     tb1, tb2 = st.columns(2)
     with tb1:
         st.markdown("**Past window**")
-        st.write(f"Start: {start_dt.strftime('%b %d, %Y, %I:%M %p %Z')}")
-        st.write(f"End:   {end_dt.strftime('%b %d, %Y, %I:%M %p %Z')}")
+        st.write(f"Start: {start_dt.date():%b %d, %Y}")
+        st.write(f"End:   {end_dt.date():%b %d, %Y}")
         st.write(f"Seconds: {au_base['seconds']:,.0f}")
         st.write(f"Minutes: {au_base['minutes']:,.0f}")
         st.write(f"Hours:   {au_base['hours']:,.0f}")
-        st.write(f"Days:    {days_disp:,.2f}" + (" (inclusive)" if inclusive_days else ""))
+        st.write(f"Days:    {days_disp:,.2f}" + (" (inclusive display)" if inclusive_days else ""))
 
     with tb2:
         if add_future:
+            projected_end_dt = end_dt + timedelta(seconds=future_seconds)
             st.markdown("**Past + Future window**")
-            st.write(f"Projected end: {(end_dt + timedelta(seconds=future_seconds)).strftime('%b %d, %Y, %I:%M %p %Z')}")
+            st.write(f"Projected end: {projected_end_dt.date():%b %d, %Y}")
             st.write(f"Seconds: {au_total['seconds']:,.0f}")
             st.write(f"Minutes: {au_total['minutes']:,.0f}")
             st.write(f"Hours:   {au_total['hours']:,.0f}")
-            st.write(f"Days:    {days_total_disp:,.2f}" + (" (inclusive)" if inclusive_days else ""))
+            st.write(f"Days:    {days_total_disp:,.2f}" + (" (inclusive display)" if inclusive_days else ""))
         else:
             st.info("No future window added. Toggle it in the sidebar to project forward.")
-
 
 # ---------- Targeting ----------
 
@@ -300,7 +299,6 @@ if target_toggle and target_amount > 0:
         units_list = list(TIME_UNITS.keys())
         top_df, full_df = closest_scenarios(base_seconds, target_amount, units_list, COIN_PRESETS, top_k=20)
 
-        # Pretty print
         view = top_df.copy()
         view["Amount"] = view["Amount"].map(money)
         view["Rate (per unit)"] = view["Rate (per unit)"].map(lambda x: f"${x:,.2f}")
@@ -308,14 +306,14 @@ if target_toggle and target_amount > 0:
         view["% Δ"] = view["% Δ"].map(lambda x: f"{x:.2f}%")
         st.dataframe(view, use_container_width=True)
 
-        st.caption("These are the closest 'clean' combinations across coin presets and time units for the **past** window.")
+        st.caption("Closest 'clean' combinations (coin presets × time units) for the **past** window.")
     else:
         req_rate = solve_rate_for_target(base_seconds, unit, target_amount)
         if math.isfinite(req_rate):
             st.success(
-                f"To hit {money(target_amount)} using **{unit}**, use a rate of **{money(req_rate)} per {unit}** (past window only)."
+                f"To hit {money(target_amount)} using **{unit}**, use a rate of **{money(req_rate)} per {unit}** (past window)."
             )
-            st.caption("Tip: round that rate to a nearby 'clean' number for persuasion, and show the new total below.")
+            st.caption("Tip: round to a nearby clean coin/unit combo for persuasion, then display that result above.")
         else:
             st.error("Cannot solve for rate: zero elapsed units.")
 
@@ -324,8 +322,11 @@ if target_toggle and target_amount > 0:
 st.markdown("---")
 st.subheader("📝 Narrative Helper")
 
-amt_for_narr = amount_now
-narr = make_narrative(start_dt, end_dt, base_seconds, unit, applied_rate, amt_for_narr)
+narr = make_narrative(start_dt, end_dt, base_seconds, unit, applied_rate, compute_amount(base_seconds, unit, applied_rate), inclusive_days)
+# Fix the param order: we passed amount in the wrong place; recompute properly:
+amt_for_narr = compute_amount(base_seconds, unit, applied_rate)
+narr = make_narrative(start_dt, end_dt, base_seconds, unit, applied_rate, amt_for_narr, inclusive_days)
+
 st.text_area("Copy-ready paragraph", value=narr, height=140)
 
 # ---------- Exports ----------
@@ -333,7 +334,7 @@ st.text_area("Copy-ready paragraph", value=narr, height=140)
 st.markdown("---")
 st.subheader("📤 Exports")
 
-# CSV export of best scenarios (if any)
+# CSV export (best scenarios)
 if top_df is not None and not top_df.empty:
     csv_bytes = top_df.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -348,21 +349,19 @@ else:
 
 # PDF export (if available)
 if REPORTLAB_AVAILABLE:
-    # Build a compact summary dict
     summary_info = {
-        "Start": start_dt.strftime("%b %d, %Y, %I:%M %p %Z"),
-        "End": end_dt.strftime("%b %d, %Y, %I:%M %p %Z"),
+        "Start": f"{start_dt.date():%b %d, %Y}",
+        "End": f"{end_dt.date():%b %d, %Y}",
         "Unit & Rate": f"{unit} @ {money(applied_rate)}/{unit}",
         "Past Amount": money(amount_now),
         "Future Added": f"{fut_years} years, {fut_days} days" if add_future else "None",
         "Past + Future Amount": money(amount_total) if add_future else "—",
-        "Inclusive days": "Yes" if inclusive_days else "No",
+        "Inclusive days (display)": "Yes" if inclusive_days else "No",
         "Generated": datetime.now(LA_TZ).strftime("%b %d, %Y, %I:%M %p %Z"),
     }
 
     pdf_buf = io.BytesIO()
-    hdr = "Time × Money Damages Summary"
-    export_summary_pdf(pdf_buf, hdr, summary_info, top_df)
+    export_summary_pdf(pdf_buf, "Time × Money Damages Summary", summary_info, top_df)
 
     st.download_button(
         "Download summary (PDF)",
@@ -375,8 +374,5 @@ else:
     st.info("Optional PDF export requires `reportlab`. Install with: `pip install reportlab`.")
 
 # Footer
-st.markdown(
-    "<hr style='opacity:0.2'/>",
-    unsafe_allow_html=True
-)
-st.caption("This tool provides transparent arithmetic only and is not legal advice. Always pair with case-specific facts and law.")
+st.markdown("<hr style='opacity:0.2'/>", unsafe_allow_html=True)
+st.caption("Transparent arithmetic for demonstrative purposes only; not legal advice.")
