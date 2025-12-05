@@ -41,6 +41,8 @@ COIN_PRESETS = [
     ("Dime", 0.10),
     ("Quarter", 0.25),
     ("Dollar", 1.00),
+    ("Five Dolla", 5.00),
+    ("Twenty Dolla", 20.00),
 ]
 
 def money(x: float) -> str:
